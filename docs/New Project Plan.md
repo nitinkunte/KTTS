@@ -75,7 +75,7 @@ Phase 1 (bootstrap), then a spike for the unverified items above, then Phases 2 
 - eSpeak-NG is not called directly in the main path. `kokoro_v1.py` uses `KPipeline`, whose G2P (misaki) uses `espeakng-loader` + `phonemizer-fork` for non-English languages (es/fr/it/hi/pt) and as the English out-of-dictionary fallback.
 - `text_processing/phonemizer.py` has a second, direct `phonemizer.backend.EspeakBackend` (en-us, en-gb) with post-fixes. It is used by `process_text_chunk()` and `get_sentence_info()` to count tokens for chunk sizing, not for the audio itself. This is a duplicate G2P pass and can drift from what the pipeline really phonemizes.
 - Its lang map has a bogus `"z": "z"` entry.
-- Environment: `PHONEMIZER_ESPEAK_PATH`, `PHONEMIZER_ESPEAK_DATA`, `ESPEAK_DATA_PATH` (see `docker/cpu/Dockerfile.optimized`, `start-cpu.sh`, `docs/internals/espeak-setup-fix.md`). Local runs need `espeak-ng` installed; on macOS, `brew install espeak-ng`.
+- Environment: `PHONEMIZER_ESPEAK_PATH`, `PHONEMIZER_ESPEAK_DATA`, `PHONEMIZER_ESPEAK_DATA_PATH`, `ESPEAK_DATA_PATH` (see `docker/cpu/Dockerfile.optimized`, `start-cpu.sh`, `docs/internals/espeak-setup-fix.md`). Local runs need `espeak-ng` installed; on macOS, `brew install espeak-ng`.
 - Risks: global `phonemizers` dict is not thread-safe (espeak library is process-global state); data path breakage is the most common setup failure; the Japanese/Chinese/Korean extras pull heavy dependencies (UniDic ~526MB).
 
 ### Voice cloning / out-of-scope features
@@ -103,7 +103,7 @@ Phase 1 (bootstrap), then a spike for the unverified items above, then Phases 2 
 Consequences:
 - Drop FastAPI, uvicorn, pydantic-settings, CORS, streaming HTTP, docker/, charts/, web/.
 - Drop torch CUDA paths (`_check_memory`, `_clear_memory`, OOM retry) and the `use_gpu` setting.
-- Drop spaCy and `en-core-web-sm` unless the English normalizer needs it (check `normalization/english.py` first).
+- The English normalizer does not use spaCy, but Misaki's English G2P requires spaCy and `en-core-web-sm`; keep both for synthesis.
 - Persistence is mandatory, so the session store is a core component, not an option.
 
 ### Foreign and made-up words (requirement 2)
@@ -153,6 +153,19 @@ stateDiagram-v2
 4. Input: plain text only, passed as a positional string or via `-f/--file` (see the CLI table in Phase 5).
 
 ### Phase 1: Bootstrap the new repo
+
+**Status (2026-10-15): Complete; awaiting review.**
+
+- Renamed the package to `ktts`, established the planned source layout, copied
+  the requested Kokoro-FastAPI modules, and added only the inference base and
+  schema types required by their imports.
+- Added the trimmed runtime dependencies and `pytest` development dependency;
+  the upstream commit and license attribution are recorded in `README.md`.
+- Validation passed on Python 3.12.9: `uv run pytest` (3 passed), copied-module
+  compile/import checks, `uv run ktts --help`, `uv lock --check`, and `uv build`.
+- eSpeak behavior, foreign-name fixtures, and real model synthesis remain for
+  Phase 2 and later.
+
 1. Create a new repo (keep the Apache/MIT license notices and attribution to Kokoro-FastAPI and Kokoro).
 2. Layout:
    ```
@@ -165,9 +178,40 @@ stateDiagram-v2
 5. Pin versions as in the source project; the stack is version-sensitive.
 
 ### Phase 2: eSpeak setup and validation
+
+**Status (2026-10-15): Complete; awaiting review.**
+
+- Verified Homebrew eSpeak NG 1.52.0 and the bundled `espeakng-loader` data on
+  Apple Silicon. The runtime accepts `ESPEAK_DATA_PATH`,
+  `PHONEMIZER_ESPEAK_DATA`, and phonemizer's documented
+  `PHONEMIZER_ESPEAK_DATA_PATH`; invalid paths fail with Homebrew setup
+  guidance. README now documents installation and fallback.
+- Replaced the duplicate phonemizer pass with Misaki English G2P configured
+  with the same eSpeak fallback as Kokoro's pipeline. The pipeline and text
+  chunk counter now share the same US/UK G2P instance. Calls are serialized.
+- Kept the `en_core_web_sm` model as an explicit dependency despite the
+  original tentative removal: inspecting Misaki 0.9.4 showed that
+  `en.G2P.__init__` calls `spacy.cli.download()` when the model is missing.
+  The English normalizer does not use spaCy, but the required G2P does, so the
+  explicit source-pinned wheel prevents a hidden first-run model download.
+- Removed the bogus `"z"` mapping. Language-switch flags are removed in the
+  eSpeak fallback. Added the explicit `ᵊ` to `ə` IPA substitution because the
+  model vocabulary has no raised-schwa token; other unmapped symbols emit a
+  warning rather than disappearing silently.
+- `ModelManager.initialize()` runs an OOV eSpeak startup check before creating
+  the inference backend.
+- Tested all planned accented/transliterated/invented name fixtures plus
+  hyphenated and apostrophe names. Every fixture yields supported tokens.
+  Nguyen is spelled out by the English fallback rather than pronounced with
+  Vietnamese phonology; custom pronunciation support remains planned for
+  Phase 5.
+- `uv run pytest` passed (23 tests). Compile/import checks, `ktts --help`, the
+  real eSpeak startup check, `uv lock --check`, `git diff --check`, and `uv
+  build` also passed. Existing Pydantic/Misaki deprecation warnings remain.
+
 1. Standardize install on macOS: `brew install espeak-ng`, with `espeakng-loader` as the bundled fallback; on Apple Silicon set `ESPEAK_DATA_PATH` to the Homebrew share path (`$(brew --prefix)/share/espeak-ng-data`) if the loader's data is not found.
 2. Add the foreign-name fixtures and tests from section 2 here, since they depend on the eSpeak fallback behaviour.
-3. Add a startup check that phonemizes a sample string and fails with a clear message if the data path is missing (`ESPEAK_DATA_PATH`, `PHONEMIZER_ESPEAK_DATA`).
+3. Add a startup check that phonemizes a sample string and fails with a clear message if the data path is missing (`ESPEAK_DATA_PATH`, `PHONEMIZER_ESPEAK_DATA`, `PHONEMIZER_ESPEAK_DATA_PATH`).
 4. Decide on the duplicate G2P in `phonemizer.py`:
    - Preferred: delete it and count tokens from the same G2P the pipeline uses (misaki `en.G2P` / `KPipeline.g2p`), removing drift and the second eSpeak instance.
    - Otherwise keep it, remove the `"z"` mapping, and guard with a lock.
@@ -175,12 +219,56 @@ stateDiagram-v2
 6. Tests: phonemize known strings for en-us/en-gb, missing-data error path, thread safety.
 
 ### Phase 3: Strip non-goals
+
+**Status (2026-10-15): Complete; awaiting review.**
+
+- Removed voice/rate tag parsing and splitting, SSML translation, SSML/voice
+  feature flags, alias/voice metadata, voice tensor combining, transient voice
+  serialization/cache files, and API/web/temp-file configuration and helpers.
+- Voice lookup now resolves a single `.pt` file by name and rejects path
+  traversal; the model pipeline receives that path directly.
+- Removed GPU/MPS/ROCm selection, memory management, and CUDA OOM retry paths
+  so the backend and manager are CPU-only. Simplified model configuration and
+  removed the no-longer-needed direct Pydantic dependency.
+- Kept the English normalizer, chunker, pause tags, custom IPA notation,
+  audio conversion, and timestamp handling. Added tests for normalized text,
+  sentence/pause chunks, audio normalization, and single-voice lookup.
+- `uv run pytest` passed (29 tests); compile/import checks, CLI help,
+  `uv lock --check`, and `git diff --check` passed.
+
 1. Remove voice combining, transients, voice tags, aliases, SSML, and related config.
 2. Replace `get_voices_path()` with a plain lookup of a single voice by name.
 3. Remove OpenAI-compat router/mappings unless an OpenAI-style endpoint is wanted.
 4. Delete tests tied to removed features; keep normalizer, text processor, and audio tests.
 
 ### Phase 4: Pause/resume core
+
+**Status (2026-10-15): Complete; awaiting review.**
+
+- Added deterministic `plan()` output with stored chunk text, token IDs,
+  phonemes, and pause duration. Rendering consumes the persisted phoneme plan
+  instead of phonemizing chunks again during synthesis.
+- Added the `Session` library API with an event-gated pause/resume state
+  machine, cursor and seek bounds, stop/export behavior, and a per-session
+  normalizer and WAV writer. Pause tags render as ordinary silence chunks.
+- Persisted session metadata atomically and each rendered chunk as an
+  independently valid WAV before advancing the cursor. Restore validates the
+  plan hash, recovers a chunk saved just before a crash, and requires an
+  explicit restart or re-plan action on a mismatch.
+- Added session TTL and a per-process concurrent-render cap. Stream closure
+  auto-pauses by default, and an OS file lock prevents two processes from
+  rendering the same session at once.
+- Pause takes effect after the current planned chunk; its audio is saved
+  before the session waits at the next boundary. Final WAV stitching occurs on
+  completion, stop, or explicit export.
+- Fixed language-code propagation in sentence and oversized-chunk token
+  counting so the stored plan uses the requested English G2P variant.
+- Validation passed on Python 3.12.9: `uv run pytest` (39 passed), compile and
+  import checks, real US/UK English plan generation with a pause chunk,
+  `ktts --help`, `uv lock --check`, `git diff --check`, and `uv build`.
+  Existing Pydantic/Misaki deprecation warnings and the uv-build version-range
+  warning remain.
+
 1. Refactor `generate_audio_stream()` into two stages:
    - `plan(text, options) -> list[Chunk]` (runs `smart_split` once, stores text, tokens, pause duration).
    - `render(chunk) -> AudioChunk`.
@@ -196,6 +284,28 @@ stateDiagram-v2
 11. Lock file per session to prevent two processes resuming the same session.
 
 ### Phase 5: Interfaces
+
+**Status (2026-10-15): Complete; awaiting review.**
+
+- Added the public asynchronous `ktts.engine.start()` helper and wired the
+  flat `ktts` CLI for positional/file input, voice listing and validation,
+  bounded speed, WAV output selection, force-overwrite, saved-session listing
+  and resume by ID or most recent unfinished session.
+- Added interactive Space pause/resume and `q` save/quit controls for TTY
+  runs; Ctrl-C leaves resumable state. Progress reports chunk index, total,
+  and text.
+- Added validated `word = IPA` lexicon files and `--strict` checks for symbols
+  that would otherwise be dropped. Lexicon and strict settings are retained
+  with the session and included in its deterministic plan hash.
+- Session output paths are persisted so CLI resume continues writing to the
+  originally selected output name.
+- README now documents Python and CLI examples, output rules, model/voice
+  locations, interactive controls, resume, strict mode, and lexicon format.
+- Validation passed on Python 3.12.9: `uv run pytest` (58 passed), compile and
+  public import checks, CLI help and behavior tests, `uv lock --check`,
+  `git diff --check`, and `uv build`. Five existing dependency deprecation
+  warnings and the uv-build version-range warning remain.
+
 1. Library: `session = engine.start(text, voice=...)`, `async for chunk in session.stream()`, `session.pause()`, `session.resume()`.
 2. CLI (`ktts`): a single flat command, all parameters optional except help. Input text is a positional string unless `-f` is given.
 
@@ -228,19 +338,45 @@ stateDiagram-v2
 4. Pronunciation lexicon: `--lexicon names.txt` (see the CLI table above).
 
 ### Phase 6: Testing
-1. Unit: state machine transitions, cursor accuracy, idempotent pause/resume, seek bounds.
-1a. Restart survival: run in a subprocess, SIGINT mid-run, start a new process, resume, and compare the exported audio to an uninterrupted run. Also kill -9 during a chunk and confirm resume loses at most that chunk and never reads a partial WAV.
-1b. Foreign/made-up name fixtures from section 2: zero dropped symbols or an explicit logged substitution.
-2. Audio continuity: pause and resume mid-stream, assert the concatenated output equals an uninterrupted run (sample-length and no discontinuity at the boundary) for wav and one lossy format.
-3. Normalizer/text tests ported from the source project (`test_normalizer*.py`, `test_text_processor*.py`).
-4. Concurrency: two sessions, one paused, one running.
-5. Fake the model backend in unit tests; keep one slow real-model test marked `integration`.
+**Status: complete.** Unit coverage verifies session-state transitions, cursor
+accuracy, pause/resume and seek bounds. Restart tests interrupt a child process
+with SIGINT, resume in the parent, and compare its WAV byte-for-byte with an
+uninterrupted fake-renderer run. A separate SIGKILL test confirms the completed
+chunk survives and the in-progress chunk is absent until resumed.
+
+WAV samples and encoded MP3 output are compared across paused and uninterrupted
+streams; the WAV sample data matches exactly and chunk-boundary jumps are
+identical. Existing normalization, text planning, eSpeak and foreign/invented
+name tests remain in the suite, alongside a test that confirms unsupported IPA
+symbols are reported. A concurrency test runs one session while another is
+paused. Model inference is faked in unit tests; one real-model inference test
+is marked `integration`, skipped by default, and requires
+`KTTS_RUN_INTEGRATION=1` plus model/voice files installed with `ktts setup`.
+
+Validation on Python 3.12.9: `uv run pytest` passed (66 passed, 1 skipped).
+The skipped test is the opt-in real-model integration test; actual model
+inference was not run in this environment. Five upstream Pydantic/Misaki
+deprecation warnings remain.
 
 ### Phase 7: Packaging and docs
-1. Package with `uv` and a `[project.scripts]` entry point; install via `uv tool install .`.
-2. Model and voice download step (`ktts setup`) pulling Kokoro weights to a local cache.
-3. README: install (`brew install espeak-ng`), espeak troubleshooting, pause/resume usage, foreign-name handling.
-4. Optional CI: ruff and pytest; no Docker.
+**Status: complete.** The package exposes the `ktts` entry point and is
+configured for installation with `uv tool install .`. The `ktts setup`
+subcommand downloads the configured Kokoro v1.0 weights, model configuration,
+and one or more voice files from the configured Hugging Face repository into
+the local model and voice directories. Downloads are copied through temporary
+files and atomically renamed; existing non-empty assets are retained. The
+default voice is `af_heart`. Asset file names were verified against the
+`hexgrad/Kokoro-82M` repository.
+
+The README documents tool installation, model/voice setup, the integration
+test opt-in, eSpeak installation/troubleshooting, pause/resume, and foreign
+name pronunciation. Optional CI and Docker remain out of scope.
+
+Validation passed: `uv build` created the wheel and source distribution,
+`uv lock --check`, `git diff --check`, and CLI help checks for `ktts` and
+`ktts setup`. `uv tool install .` was smoke-tested using isolated temporary
+tool and executable directories; both installed CLI help commands ran
+successfully. The temporary installation was removed after verification.
 
 ## 4. Risks and Open Questions
 
