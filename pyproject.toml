@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "A pause-and-resume Kokoro text-to-speech CLI and library"
 readme = "README.md"
 authors = [
-    { name = "Nitin Kunte", email = "nitin_kunte@hotmail.com" }
+    { name = "Nitin K", email = "yyyyy@yyyy" }
 ]
 requires-python = ">=3.10"
 dependencies = [
