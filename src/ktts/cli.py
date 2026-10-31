@@ -1,5 +1,7 @@
 """Command-line interface for local Kokoro synthesis."""
 
+from __future__ import annotations
+
 import argparse
 import asyncio
 import os
@@ -15,13 +17,37 @@ from huggingface_hub.errors import HfHubHTTPError
 from .core import paths
 from .core.config import settings
 from .model_setup import download_voices, setup_model_and_voices
-from .session import (
-    Session,
-    SessionError,
-    latest_unfinished_session_id,
-    list_saved_sessions,
-)
 from .textproc.vocabulary import VOCAB, normalize_phonemes
+
+
+def _load_session_api() -> None:
+    if "Session" in globals():
+        return
+    from .session import (
+        Session,
+        SessionError,
+        latest_unfinished_session_id,
+        list_saved_sessions,
+    )
+
+    globals().update(
+        Session=Session,
+        SessionError=SessionError,
+        latest_unfinished_session_id=latest_unfinished_session_id,
+        list_saved_sessions=list_saved_sessions,
+    )
+
+
+def __getattr__(name: str):
+    if name in {
+        "Session",
+        "SessionError",
+        "latest_unfinished_session_id",
+        "list_saved_sessions",
+    }:
+        _load_session_api()
+        return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _positive_float(value: str) -> float:
@@ -262,6 +288,7 @@ def _validate_input(parser: argparse.ArgumentParser, args: argparse.Namespace) -
 
 
 def _print_sessions() -> None:
+    _load_session_api()
     records = list_saved_sessions()
     if not records:
         print("No saved sessions.")
@@ -291,6 +318,7 @@ async def _main_async(args: argparse.Namespace, parser: argparse.ArgumentParser)
         _print_sessions()
         return
     if args.resume is not None:
+        _load_session_api()
         session_id = args.resume or latest_unfinished_session_id()
         session = await Session.restore(session_id)
         session.resume()
@@ -318,6 +346,7 @@ async def _main_async(args: argparse.Namespace, parser: argparse.ArgumentParser)
             f"Output file already exists: {output_path}. Use --force to overwrite it."
         )
     lexicon = _load_lexicon(args.lexicon)
+    _load_session_api()
     session = await Session.create(
         text,
         voice=args.voice,
@@ -347,6 +376,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = build_parser()
     args = parser.parse_args(arguments)
     _validate_input(parser, args)
+    _load_session_api()
+
     try:
         asyncio.run(_main_async(args, parser))
     except KeyboardInterrupt:
